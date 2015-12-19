@@ -1,8 +1,3 @@
-// You can use many types redis connection packages, including:
-// node redis | https://github.com/mranney/node_redis
-// fake redis | https://github.com/hdachev/fakeredis
-// sentinel redis | https://github.com/ortoo/node-redis-sentinel
-
 exports.default = { 
   redis: function(api){
     var redisDetails = {
@@ -11,28 +6,21 @@ exports.default = {
       // How long to wait for an RPC call before considering it a failure 
       rpcTimeout: 5000, 
       // which redis package should you ise?
-      package: 'fakeredis'
+      package: 'fakeredis',
+
+      // Basic configuration options
+      host     : process.env.REDIS_HOST || '127.0.0.1',
+      port     : process.env.REDIS_PORT || 6379,
+      database : process.env.REDIS_DB   || 0,
     }
 
     if( process.env.FAKEREDIS === 'false' || process.env.REDIS_HOST !== undefined ){
-      // You can opt to use a real redis DB
-      // This is required for multi-server deployments
-
-      redisDetails.package  = 'redis';
-      redisDetails.host     = process.env.REDIS_HOST || '127.0.0.1';
-      redisDetails.port     = process.env.REDIS_PORT || 6379;
-      redisDetails.password = process.env.REDIS_PASS || null;
-      redisDetails.database = process.env.REDIS_DB   || 0;
-      redisDetails.options  = null;
-
-      // redisDetails.package  = 'redis-sentinel-client';
-      // redisDetails.port     =  26379;
-      // redisDetails.host     = '127.0.0.1';
-      // redisDetails.database = 0;
-      // redisDetails.options  = {
-      //   master_auth_pass: null,
-      //   masterName: 'BUS',
-      // };
+      redisDetails.package  = 'ioredis';
+      // there are many more connection options, including support for cluster and sentinel
+      // learn more @ https://github.com/luin/ioredis
+      redisDetails.options  = {
+        password: (process.env.REDIS_PASS || null),
+      };
     }
 
     return redisDetails;
@@ -43,16 +31,15 @@ exports.test = {
   redis: function(api){
     var package = 'fakeredis';
     if(process.env.FAKEREDIS === 'false'){
-      package = 'redis';
+      package = 'ioredis';
     }
 
     return {
-      'package': package,
-      'host': '127.0.0.1',
-      'port': 6379,
-      'password': null,
-      'options': null,
-      'database': 2
+      package: package,
+      host: '127.0.0.1',
+      port: 6379,
+      database: 2,
+      options: {},
     }
   }
 }

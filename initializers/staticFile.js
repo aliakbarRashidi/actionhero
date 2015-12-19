@@ -42,6 +42,7 @@ module.exports = {
 
       sendFile: function(file, connection, callback){
         var self = this;
+        var lastModified;
         fs.stat(file, function(err, stats){
           if(err){
             self.sendFileNotFound(connection, api.config.errors.fileReadError(String(err)) , callback);
@@ -50,22 +51,21 @@ module.exports = {
             var length = stats.size;
             var fileStream = fs.createReadStream(file);
             var start = new Date().getTime();
+            lastModified=stats.mtime;
             fileStream.on('close', function(){
-              api.stats.increment('staticFiles:filesSent');
               var duration = new Date().getTime() - start;
               self.logRequest(file, connection, length, duration, true);
             });
             fileStream.on('error', function(err){
               api.log(err)
             });
-            callback(connection, null, fileStream, mime, length);
+            callback(connection, null, fileStream, mime, length, lastModified);
           }
         });
       },
 
       sendFileNotFound: function(connection, errorMessage, callback){
         var self = this;
-        api.stats.increment('staticFiles:failedFileRequests');
         connection.error = new Error(errorMessage);
         self.logRequest('{404: not found}', connection, null, null, false);
         callback(connection, api.config.errors.fileNotFound(), null, 'text/html', api.config.errors.fileNotFound().length);

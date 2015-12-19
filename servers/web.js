@@ -1,7 +1,8 @@
 var url                 = require('url');
+var qs                  = require('qs');
 var fs                  = require('fs');
 var path                = require('path');
-var util                = require('util');
+var zlib                = require('zlib');
 var formidable          = require('formidable');
 var browser_fingerprint = require('browser_fingerprint');
 var Mime                = require('mime');
@@ -80,48 +81,102 @@ var initialize = function(api, options, next){
     if(connection.rawConnection.method !== 'HEAD'){
       stringResponse = String(message);
     }
-    connection.rawConnection.responseHeaders.push(['Content-Length', Buffer.byteLength(stringResponse, 'utf8')]);
+    
     cleanHeaders(connection);
     var headers = connection.rawConnection.responseHeaders;
     var responseHttpCode = parseInt(connection.rawConnection.responseHttpCode);
-    connection.rawConnection.res.writeHead(responseHttpCode, headers);
-    connection.rawConnection.res.end(stringResponse);
-    connection.destroy();
+
+    server.sendWithCompression(connection, responseHttpCode, headers, stringResponse);
   }
 
-  server.sendFile = function(connection, error, fileStream, mime, length){
+  server.sendFile = function(connection, error, fileStream, mime, length, lastModified){
     var foundExpires = false;
     var foundCacheControl = false;
-
+    var ifModifiedSince;
+    var reqHeaders;
     connection.rawConnection.responseHeaders.forEach(function(pair){
       if( pair[0].toLowerCase() === 'expires' )      { foundExpires = true; }
       if( pair[0].toLowerCase() === 'cache-control' ){ foundCacheControl = true; }
     })
 
+    reqHeaders = connection.rawConnection.req.headers;
+    if(reqHeaders['if-modified-since']){ifModifiedSince = new Date(reqHeaders['if-modified-since'])}
+
     connection.rawConnection.responseHeaders.push(['Content-Type', mime]);
-    connection.rawConnection.responseHeaders.push(['Content-Length', length]);
     if(foundExpires === false)      { connection.rawConnection.responseHeaders.push(['Expires', new Date(new Date().getTime() + api.config.servers.web.flatFileCacheDuration * 1000).toUTCString()]); }
     if(foundCacheControl === false) { connection.rawConnection.responseHeaders.push(['Cache-Control', 'max-age=' + api.config.servers.web.flatFileCacheDuration + ', must-revalidate, public']); }
-    
+
+    connection.rawConnection.responseHeaders.push(['Last-Modified',new Date(lastModified)]);
     cleanHeaders(connection);
     var headers = connection.rawConnection.responseHeaders;
     if(error){ connection.rawConnection.responseHttpCode = 404 }
+    if(ifModifiedSince && lastModified <= ifModifiedSince){connection.rawConnection.responseHttpCode = 304}
     var responseHttpCode = parseInt(connection.rawConnection.responseHttpCode);
-    connection.rawConnection.res.writeHead(responseHttpCode, headers);
     if(error){
-      connection.rawConnection.res.end(String(error));
-      connection.destroy();
+      server.sendWithCompression(connection, responseHttpCode, headers, String(error));
+    }
+    else if(responseHttpCode !== 304){
+      server.sendWithCompression(connection, responseHttpCode, headers, null, fileStream, length);
     } else {
-      fileStream.pipe(connection.rawConnection.res);
-      fileStream.on('end', function(){
-        connection.destroy();
-      });
+      connection.rawConnection.res.writeHead(responseHttpCode, headers);
+      connection.rawConnection.res.end();
+      connection.destroy();
+    }
+  };
+
+  server.sendWithCompression = function(connection, responseHttpCode, headers, stringResponse, fileStream, fileLength){
+    var acceptEncoding = connection.rawConnection.req.headers['accept-encoding'];
+    var compressor, stringEncoder;
+    if(!acceptEncoding){ acceptEncoding = ''; }
+
+    // Note: this is not a conformant accept-encoding parser.
+    // https://nodejs.org/api/zlib.html#zlib_zlib_createinflate_options
+    // See http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.3
+    if(api.config.servers.web.compress === true){
+      if(acceptEncoding.match(/\bdeflate\b/)) {
+        headers.push(['Content-Encoding', 'deflate']);
+        compressor = zlib.createDeflate();
+        stringEncoder = zlib.deflate;
+      }else if(acceptEncoding.match(/\bgzip\b/)){
+        headers.push(['Content-Encoding', 'gzip']);
+        compressor = zlib.createGzip();
+        stringEncoder = zlib.gzip;
+      }
+    }
+
+    // note: the 'end' event may not fire on some OSes; finish will
+    connection.rawConnection.res.on('finish', function(){ 
+      connection.destroy(); 
+    });
+
+    if(fileStream){
+      if(compressor){
+        // headers.push(['Content-Length', fileLength]); // TODO
+        connection.rawConnection.res.writeHead(responseHttpCode, headers);
+        fileStream.pipe(compressor).pipe(connection.rawConnection.res);
+      }else{
+        headers.push(['Content-Length', fileLength]);
+        connection.rawConnection.res.writeHead(responseHttpCode, headers);
+        fileStream.pipe(connection.rawConnection.res);
+      }
+    }else{
+      if(stringEncoder){
+        stringEncoder(stringResponse, function(error, zippedString){
+          headers.push(['Content-Length', zippedString.length]);
+          connection.rawConnection.res.writeHead(responseHttpCode, headers);
+          connection.rawConnection.res.end(zippedString);
+        });
+      }else{
+        headers.push(['Content-Length', Buffer.byteLength(stringResponse)]);
+        connection.rawConnection.res.writeHead(responseHttpCode, headers);
+        connection.rawConnection.res.end(stringResponse);
+      }
     }
   };
 
   server.goodbye = function(connection){
     // disconnect handlers
-  }
+  };
 
   ////////////
   // EVENTS //
@@ -261,7 +316,7 @@ var initialize = function(api, options, next){
       if(data.response.error){
         data.response.error = api.config.errors.serializers.servers.web(data.response.error);
       }
-      
+
       var stringResponse = '';
 
       if( extractHeader(data.connection, 'Content-Type').match(/json/) ){
@@ -346,15 +401,15 @@ var initialize = function(api, options, next){
     // API
     else if(requestMode === 'api'){
       if(connection.rawConnection.method === 'TRACE'){ requestMode = 'trace'; }
-
-      fillParamsFromWebRequest(connection, connection.rawConnection.parsedURL.query);
-      connection.rawConnection.params.query = connection.rawConnection.parsedURL.query;        
+      var search = connection.rawConnection.parsedURL.search.slice(1);
+      fillParamsFromWebRequest(connection, qs.parse(search, api.config.servers.web.queryParseOptions));
+      connection.rawConnection.params.query = connection.rawConnection.parsedURL.query;
       if(
           connection.rawConnection.method !== 'GET' &&
-          connection.rawConnection.method !== 'HEAD' && 
-          ( 
+          connection.rawConnection.method !== 'HEAD' &&
+          (
             connection.rawConnection.req.headers['content-type'] ||
-            connection.rawConnection.req.headers['Content-Type']  
+            connection.rawConnection.req.headers['Content-Type']
           )
       ){
         connection.rawConnection.form = new formidable.IncomingForm();
@@ -402,7 +457,7 @@ var initialize = function(api, options, next){
     if(collapsedVarsHash !== false){
       varsHash = {payload: collapsedVarsHash} // post was an array, lets call it "payload"
     }
-    
+
     for(var v in varsHash){
       connection.params[v] = varsHash[v];
     }
@@ -453,13 +508,13 @@ var initialize = function(api, options, next){
           server.log('removed stale unix socket @ ' + port);
         }
       });
-    } 
+    }
   }
 
   var chmodSocket = function(bindIP, port){
-    if(!options.bindIP && options.port.indexOf('/') >= 0){ 
-      fs.chmodSync(port, 0777); 
-    } 
+    if(!options.bindIP && options.port.indexOf('/') >= 0){
+      fs.chmodSync(port, 0777);
+    }
   }
 
   next(server);
